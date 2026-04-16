@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jarvis Voice</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+        <h1 style="margin:0 0 10px 0; letter-spacing:0.14em;">JARVIS SYSTEM</h1>
+        <button id="startBtn">AKTYWUJ</button>
+        <div id="status" class="status" style="margin-top:12px;">Oczekiwanie...</div>
+    </div>
+
+    <div class="card">
+        <div class="label-row">
+            <div class="label">Pamięć Jarvisa</div>
+            <div class="pill">kontrolowana</div>
+        </div>
+
+        <textarea id="memoryInput" class="memory-input" placeholder="Np. Aleks używa Proxmox, Pterodactyl i Ubuntu. Jarvis ma odpowiadać krótko."></textarea>
+
+        <div class="memory-actions">
+            <button id="saveMemoryBtn">Zapisz pamięć</button>
+            <button id="clearMemoryBtn" class="secondary">Wyczyść pamięć</button>
+        </div>
+
+        <pre id="memoryBox" class="memory-box">Brak zapisanych notatek.</pre>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="label">Mikrofon</div>
+            <canvas id="micCanvas" width="800" height="180"></canvas>
+        </div>
+        <div class="card">
+            <div class="label">Jarvis</div>
+            <canvas id="outCanvas" width="800" height="180"></canvas>
+        </div>
+    </div>
+</div>
+
+<script>
+const startBtn = document.getElementById("startBtn");
+const saveMemoryBtn = document.getElementById("saveMemoryBtn");
+const clearMemoryBtn = document.getElementById("clearMemoryBtn");
+const memoryInput = document.getElementById("memoryInput");
+const memoryBox = document.getElementById("memoryBox");
+const statusEl = document.getElementById("status");
+const micCanvas = document.getElementById("micCanvas");
+const outCanvas = document.getElementById("outCanvas");
+const micCtx = micCanvas.getContext("2d");
+const outCtx = outCanvas.getContext("2d");
+
+let ws = null;
+let audioCtx = null;
+let micSource = null;
+let micAnalyser = null;
+let outAnalyser = null;
+let processor = null;
+let zeroGain = null;
+let inputStream = null;
+
+let playbackSources = [];
+let playbackCursor = 0;
+
+function setStatus(text) {
+    statusEl.textContent = text;
+}
+
+function updateMemoryBox(items) {
+    if (!items || !items.length) {
+        memoryBox.textContent = "Brak zapisanych notatek.";
+        return;
+    }
+    memoryBox.textContent = items.map((item, index) => `${index + 1}. ${item}`).join("\n");
+}
+
+function sendJson(payload) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(payload));
+        return true;
+    }
+    return false;
+}
+
+function float32To16BitPCM(input) {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return output;
+}
+
+function base64FromBytes(bytes) {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+}
+
+function downsampleBuffer(inputBuffer, inputSampleRate, outputSampleRate) {
+    if (outputSampleRate === inputSampleRate) {
+        return inputBuffer;
+    }
+
+    if (outputSampleRate > inputSampleRate) {
+        throw new Error("Output sample rate should be lower than input sample rate.");
+    }
+
+    const sampleRateRatio = inputSampleRate / outputSampleRate;
+    const newLength = Math.round(inputBuffer.length / sampleRateRatio);
+    const result = new Float32Array(newLength);
+
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+
+    while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        let accum = 0;
+        let count = 0;
+
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < inputBuffer.length; i++) {
+            accum += inputBuffer[i];
+            count++;
+        }
+
+        result[offsetResult] = count > 0 ? accum / count : inputBuffer[offsetBuffer] || 0;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+    }
+
+    return result;
+}
+
+function drawWave(canvasCtx, analyser, color) {
+    if (!analyser) return;
+
+    const width = analyser.context?.canvas?.width || 800;
+    const height = analyser.context?.canvas?.height || 180;
+    const bufferLength = analyser.fftSize;
+    const dataArray = new Uint8Array(bufferLength);
+
+    analyser.getByteTimeDomainData(dataArray);
+
+    canvasCtx.fillStyle = "#000";
+    canvasCtx.fillRect(0, 0, width, height);
+
+    canvasCtx.lineWidth = 2;
+    canvasCtx.strokeStyle = color;
+    canvasCtx.beginPath();
+
+    const sliceWidth = width / bufferLength;
+    let x = 0;
+
+    for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = (v * height) / 2;
+
+        if (i === 0) canvasCtx.moveTo(x, y);
+        else canvasCtx.lineTo(x, y);
+
+        x += sliceWidth;
+    }
+
+    canvasCtx.stroke();
+}
+
+function stopPlayback() {
+    for (const src of playbackSources) {
+        try { src.stop(); } catch (e) {}
+    }
+    playbackSources = [];
+    playbackCursor = 0;
+}
+
+async function playJarvisAudio(arrayBuffer) {
+    if (!audioCtx) return;
+
+    const int16 = new Int16Array(arrayBuffer);
+    const buffer = audioCtx.createBuffer(1, int16.length, 24000);
+    const channel = buffer.getChannelData(0);
+
+    for (let i = 0; i < int16.length; i++) {
+        channel[i] = int16[i] / 32768;
+    }
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(outAnalyser);
+
+    const startAt = Math.max(audioCtx.currentTime + 0.03, playbackCursor);
+    source.start(startAt);
+    playbackCursor = startAt + buffer.duration;
+
+    playbackSources.push(source);
+    setStatus("Jarvis mówi...");
+
+    source.onended = () => {
+        playbackSources = playbackSources.filter(item => item !== source);
+        if (playbackSources.length === 0) {
+            setStatus("Gotowy.");
+        }
+    };
+}
+
+async function start() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        setStatus("Już połączono.");
+        return;
+    }
+
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${protocol}//${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = async () => {
+        setStatus("Połączono. Jarvis słucha.");
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        await audioCtx.resume();
+
+        inputStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                channelCount: 1
+            }
+        });
+
+        micSource = audioCtx.createMediaStreamSource(inputStream);
+
+        micAnalyser = audioCtx.createAnalyser();
+        micAnalyser.fftSize = 1024;
+
+        outAnalyser = audioCtx.createAnalyser();
+        outAnalyser.fftSize = 1024;
+        outAnalyser.connect(audioCtx.destination);
+
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        zeroGain = audioCtx.createGain();
+        zeroGain.gain.value = 0;
+
+        micSource.connect(micAnalyser);
+        micSource.connect(processor);
+        processor.connect(zeroGain);
+        zeroGain.connect(audioCtx.destination);
+
+        processor.onaudioprocess = (event) => {
+            const input = event.inputBuffer.getChannelData(0);
+
+            let sum = 0;
+            for (let i = 0; i < input.length; i++) {
+                sum += input[i] * input[i];
+            }
+            const rms = Math.sqrt(sum / input.length);
+
+            if (rms > 0.012 && playbackSources.length > 0) {
+                stopPlayback();
+                setStatus("Przerwano odpowiedź.");
+            }
+
+            const downsampled = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+            const pcm = float32To16BitPCM(downsampled);
+            const bytes = new Uint8Array(pcm.buffer);
+            const base64 = base64FromBytes(bytes);
+
+            sendJson({
+                audio: base64,
+                sampleRate: 16000
+            });
+        };
+
+        drawLoop();
+    };
+
+    ws.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+            try {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === "memory_state") {
+                    updateMemoryBox(msg.items);
+                    return;
+                }
+
+                if (msg.type === "assistant_speaking") {
+                    if (msg.speaking) {
+                        setStatus("Jarvis mówi...");
+                    } else if (!playbackSources.length) {
+                        setStatus("Gotowy.");
+                    }
+                    return;
+                }
+
+                if (msg.type === "interrupted") {
+                    stopPlayback();
+                    setStatus("Przerwano odpowiedź.");
+                    return;
+                }
+
+                if (msg.type === "user_transcript") {
+                    console.log("USER:", msg.text);
+                    return;
+                }
+
+                if (msg.type === "output_transcript") {
+                    console.log("JARVIS:", msg.text);
+                    return;
+                }
+            } catch (e) {
+                console.log("TEXT:", event.data);
+            }
+            return;
+        }
+
+        let buffer = event.data;
+        if (buffer instanceof Blob) {
+            buffer = await buffer.arrayBuffer();
+        }
+
+        await playJarvisAudio(buffer);
+    };
+
+    ws.onerror = () => {
+        setStatus("Błąd WebSocket.");
+    };
+
+    ws.onclose = () => {
+        setStatus("Połączenie zamknięte.");
+        stopPlayback();
+
+        if (processor) {
+            try { processor.disconnect(); } catch (e) {}
+            processor = null;
+        }
+        if (zeroGain) {
+            try { zeroGain.disconnect(); } catch (e) {}
+            zeroGain = null;
+        }
+        if (micAnalyser) {
+            try { micAnalyser.disconnect(); } catch (e) {}
+            micAnalyser = null;
+        }
+        if (outAnalyser) {
+            try { outAnalyser.disconnect(); } catch (e) {}
+            outAnalyser = null;
+        }
+        if (inputStream) {
+            inputStream.getTracks().forEach(track => track.stop());
+            inputStream = null;
+        }
+    };
+}
+
+function drawLoop() {
+    requestAnimationFrame(drawLoop);
+    if (micAnalyser) drawWave(micCtx, micAnalyser, "#00ff88");
+    if (outAnalyser) drawWave(outCtx, outAnalyser, "#ffd400");
+}
+
+saveMemoryBtn.addEventListener("click", () => {
+    const text = memoryInput.value.trim();
+    if (!text) {
+        setStatus("Wpisz notatkę pamięci.");
+        return;
+    }
+
+    if (!sendJson({ memory_action: "add", text })) {
+        setStatus("Najpierw uruchom asystenta.");
+        return;
+    }
+
+    memoryInput.value = "";
+    setStatus("Pamięć zapisana.");
+});
+
+clearMemoryBtn.addEventListener("click", () => {
+    if (!sendJson({ memory_action: "clear" })) {
+        setStatus("Najpierw uruchom asystenta.");
+        return;
+    }
+    setStatus("Pamięć wyczyszczona.");
+});
+
+startBtn.addEventListener("click", start);
+</script>
+</body>
+</html>
