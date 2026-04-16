@@ -1,7 +1,8 @@
 import os
+from dotenv import load_dotenv
 
+load_dotenv()
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 # ======================
 # MODEL SETTINGS
 # ======================
@@ -9,6 +10,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PROVIDER = "gemini"  # "gemini" albo "local"
 
 GEMINI_MODEL = "gemini-2.5-flash-native-audio-latest"
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # jeśli kiedyś przejdziesz na lokalny model (np. ollama)
 LOCAL_MODEL_NAME = "llama3"
@@ -43,3 +46,15 @@ VOLUME_THRESHOLD = 0.012
 
 HOST = "0.0.0.0"
 PORT = 8000
+
+# ======================
+# DATABASE SETTINGS (Nowe!)
+# ======================
+DB_NAME = os.getenv("DB_NAME", "jarvis_db")
+DB_USER = os.getenv("DB_USER", "jarvis_db_user")
+DB_PASS = os.getenv("DB_USER_PASS", "Start$123")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+
+# URL dla SQLAlchemy (PostgreSQL)
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"

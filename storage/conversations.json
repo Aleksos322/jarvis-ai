@@ -1,22 +1,6 @@
 [
   {
     "role": "user",
-    "text": "Ciao amici."
-  },
-  {
-    "role": "assistant",
-    "text": "stai?"
-  },
-  {
-    "role": "user",
-    "text": "wać rozmowę na język polski."
-  },
-  {
-    "role": "assistant",
-    "text": "ci pomóc?"
-  },
-  {
-    "role": "user",
     "text": ", że mam na imię Alex."
   },
   {
@@ -58,5 +42,21 @@
   {
     "role": "assistant",
     "text": "przypomnieć?"
+  },
+  {
+    "role": "user",
+    "text": "30 30 30"
+  },
+  {
+    "role": "assistant",
+    "text": "UTC."
+  },
+  {
+    "role": "user",
+    "text": "możesz mówić po polsku?"
+  },
+  {
+    "role": "assistant",
+    "text": "pomóc?"
   }
 ]
