@@ -30,6 +30,11 @@ class MemoryManager:
         # Odwracamy, żeby były chronologicznie
         return [{"role": m.role, "content": m.content} for m in reversed(messages)]
 
+    def get_recent_messages(self, limit=10):
+        """Zwraca ostatnie `limit` obiektów Conversation w porządku chronologicznym (stare->nowe)."""
+        messages = self.db.query(Conversation).order_by(desc(Conversation.timestamp)).limit(limit).all()
+        return list(reversed(messages))
+
     def get_all_user_facts(self):
         """Pobiera wszystko, co Jarvis wie o Tobie"""
         facts = self.db.query(MemoryEntity).all()

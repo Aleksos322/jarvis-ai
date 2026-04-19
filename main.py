@@ -54,13 +54,26 @@ async def ws_endpoint(ws: WebSocket):
     memory = MemoryManager()
     stop_event = asyncio.Event()
 
-    # 🔥 NOWOŚĆ: Pobieramy tożsamość Jarvisa z bazy danych przed startem sesji
-    system_prompt_content = memory.build_system_prompt()
+    # 1. POBIERAMY HISTORIĘ Z BAZY (np. ostatnie 10 wiadomości)
+    try:
+        history = memory.get_recent_messages(limit=10)
+    except Exception:
+        history = []
+
+    # Obsługa różnych reprezentacji wiadomości (dict lub obiekt)
+    history_text = "\n".join([
+        f"{m['role']}: {m['content']}" if isinstance(m, dict) else f"{getattr(m, 'role', '')}: {getattr(m, 'content', '')}"
+        for m in history
+    ])
+
+    # 2. BUDUJEMY ROZSZERZONY PROMPT SYSTEMOWY
+    base_prompt = memory.build_system_prompt()
+    full_system_prompt = f"{base_prompt}\n\nOto historia Twojej poprzedniej rozmowy z użytkownikiem:\n{history_text}"
 
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
         system_instruction=types.Content(
-            parts=[types.Part(text=system_prompt_content)]
+            parts=[types.Part(text=full_system_prompt)]
         ),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
