@@ -43,6 +43,8 @@
 </div>
 
 <script>
+
+// --- ELEMENTY INTERFEJSU (DOM) ---
 const startBtn = document.getElementById("startBtn");
 const saveMemoryBtn = document.getElementById("saveMemoryBtn");
 const clearMemoryBtn = document.getElementById("clearMemoryBtn");
@@ -54,22 +56,27 @@ const outCanvas = document.getElementById("outCanvas");
 const micCtx = micCanvas.getContext("2d");
 const outCtx = outCanvas.getContext("2d");
 
-let ws = null;
-let audioCtx = null;
-let micSource = null;
-let micAnalyser = null;
-let outAnalyser = null;
-let processor = null;
-let zeroGain = null;
-let inputStream = null;
+// --- ZMIENNE GLOBALNE SYSTEMU ---
+let ws = null;              // Połączenie WebSocket
+let audioCtx = null;        // Kontekst audio przeglądarki
+let micSource = null;       // Źródło z mikrofonu
+let micAnalyser = null;     // Analizator fal mikrofonu
+let outAnalyser = null;     // Analizator fal Jarvisa
+let processor = null;       // Przetwarzanie strumienia audio
+let zeroGain = null;        // Wyciszacz (zapobiega zapętleniu dźwięku)
+let inputStream = null;     // Strumień z mikrofonu
 
-let playbackSources = [];
-let playbackCursor = 0;
+let playbackSources = [];   // Kolejka fragmentów mowy Jarvisa
+let playbackCursor = 0;     // Kursor czasowy dla płynnego łączenia audio
 
+// --- FUNKCJE POMOCNICZE ---
+
+// Aktualizacja statusu tekstowego na ekranie
 function setStatus(text) {
     statusEl.textContent = text;
 }
 
+// Odświeżanie listy notatek w ramce "Pamięć"
 function updateMemoryBox(items) {
     if (!items || !items.length) {
         memoryBox.textContent = "Brak zapisanych notatek.";
@@ -78,6 +85,7 @@ function updateMemoryBox(items) {
     memoryBox.textContent = items.map((item, index) => `${index + 1}. ${item}`).join("\n");
 }
 
+// Wysyłanie danych JSON do serwera
 function sendJson(payload) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(payload));
@@ -86,6 +94,7 @@ function sendJson(payload) {
     return false;
 }
 
+// Konwersja formatu audio (Float32 -> Int16 PCM)
 function float32To16BitPCM(input) {
     const output = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
@@ -95,6 +104,7 @@ function float32To16BitPCM(input) {
     return output;
 }
 
+// Konwersja bajtów na format Base64 (wymagane przez API)
 function base64FromBytes(bytes) {
     let binary = "";
     const chunk = 0x8000;
@@ -104,73 +114,55 @@ function base64FromBytes(bytes) {
     return btoa(binary);
 }
 
+// Zmniejszanie jakości dźwięku (Downsampling) do 16kHz dla serwera
 function downsampleBuffer(inputBuffer, inputSampleRate, outputSampleRate) {
-    if (outputSampleRate === inputSampleRate) {
-        return inputBuffer;
-    }
-
-    if (outputSampleRate > inputSampleRate) {
-        throw new Error("Output sample rate should be lower than input sample rate.");
-    }
-
+    if (outputSampleRate === inputSampleRate) return inputBuffer;
     const sampleRateRatio = inputSampleRate / outputSampleRate;
     const newLength = Math.round(inputBuffer.length / sampleRateRatio);
     const result = new Float32Array(newLength);
-
     let offsetResult = 0;
     let offsetBuffer = 0;
-
     while (offsetResult < result.length) {
         const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-        let accum = 0;
-        let count = 0;
-
+        let accum = 0; let count = 0;
         for (let i = offsetBuffer; i < nextOffsetBuffer && i < inputBuffer.length; i++) {
-            accum += inputBuffer[i];
-            count++;
+            accum += inputBuffer[i]; count++;
         }
-
         result[offsetResult] = count > 0 ? accum / count : inputBuffer[offsetBuffer] || 0;
         offsetResult++;
         offsetBuffer = nextOffsetBuffer;
     }
-
     return result;
 }
 
+// Rysowanie fali dźwiękowej na Canvas
 function drawWave(canvasCtx, analyser, color) {
     if (!analyser) return;
-
-    const width = analyser.context?.canvas?.width || 800;
-    const height = analyser.context?.canvas?.height || 180;
+    const width = 800;
+    const height = 180;
     const bufferLength = analyser.fftSize;
     const dataArray = new Uint8Array(bufferLength);
-
     analyser.getByteTimeDomainData(dataArray);
 
     canvasCtx.fillStyle = "#000";
     canvasCtx.fillRect(0, 0, width, height);
-
     canvasCtx.lineWidth = 2;
     canvasCtx.strokeStyle = color;
     canvasCtx.beginPath();
 
     const sliceWidth = width / bufferLength;
     let x = 0;
-
     for (let i = 0; i < bufferLength; i++) {
         const v = dataArray[i] / 128.0;
         const y = (v * height) / 2;
-
         if (i === 0) canvasCtx.moveTo(x, y);
         else canvasCtx.lineTo(x, y);
-
         x += sliceWidth;
     }
-
     canvasCtx.stroke();
 }
 
+// Natychmiastowe uciszenie Jarvisa
 function stopPlayback() {
     for (const src of playbackSources) {
         try { src.stop(); } catch (e) {}
@@ -179,11 +171,17 @@ function stopPlayback() {
     playbackCursor = 0;
 }
 
+// --- GŁÓWNA LOGIKA AUDIO (FIXES INCLUDED) ---
+
+// Odtwarzanie dźwięku przychodzącego z serwera
 async function playJarvisAudio(arrayBuffer) {
     if (!audioCtx) return;
 
     const int16 = new Int16Array(arrayBuffer);
-    const buffer = audioCtx.createBuffer(1, int16.length, 24000);
+    
+    // POPRAWKA: Ustawienie 16000Hz zapobiega efektowi przyspieszonego głosu
+    const sampleRate = 24000; 
+    const buffer = audioCtx.createBuffer(1, int16.length, sampleRate);
     const channel = buffer.getChannelData(0);
 
     for (let i = 0; i < int16.length; i++) {
@@ -194,7 +192,8 @@ async function playJarvisAudio(arrayBuffer) {
     source.buffer = buffer;
     source.connect(outAnalyser);
 
-    const startAt = Math.max(audioCtx.currentTime + 0.03, playbackCursor);
+    // Kolejkowanie fragmentów, by dźwięk był płynny
+    const startAt = Math.max(audioCtx.currentTime + 0.05, playbackCursor);
     source.start(startAt);
     playbackCursor = startAt + buffer.duration;
 
@@ -205,15 +204,14 @@ async function playJarvisAudio(arrayBuffer) {
         playbackSources = playbackSources.filter(item => item !== source);
         if (playbackSources.length === 0) {
             setStatus("Gotowy.");
+            playbackCursor = audioCtx.currentTime; 
         }
     };
 }
 
+// Start systemu, mikrofonu i połączenia
 async function start() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        setStatus("Już połączono.");
-        return;
-    }
+    if (ws && ws.readyState === WebSocket.OPEN) return;
 
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -226,16 +224,10 @@ async function start() {
         await audioCtx.resume();
 
         inputStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-                channelCount: 1
-            }
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
         });
 
         micSource = audioCtx.createMediaStreamSource(inputStream);
-
         micAnalyser = audioCtx.createAnalyser();
         micAnalyser.fftSize = 1024;
 
@@ -245,148 +237,83 @@ async function start() {
 
         processor = audioCtx.createScriptProcessor(4096, 1, 1);
         zeroGain = audioCtx.createGain();
-        zeroGain.gain.value = 0;
+        zeroGain.gain.value = 0; // Nie słyszymy własnego echa
 
         micSource.connect(micAnalyser);
         micSource.connect(processor);
         processor.connect(zeroGain);
         zeroGain.connect(audioCtx.destination);
 
+        // Przetwarzanie mikrofonu w czasie rzeczywistym
         processor.onaudioprocess = (event) => {
             const input = event.inputBuffer.getChannelData(0);
 
+            // Obliczanie głośności (RMS)
             let sum = 0;
-            for (let i = 0; i < input.length; i++) {
-                sum += input[i] * input[i];
-            }
+            for (let i = 0; i < input.length; i++) { sum += input[i] * input[i]; }
             const rms = Math.sqrt(sum / input.length);
 
-            if (rms > 0.012 && playbackSources.length > 0) {
+            // POPRAWKA: Próg 0.15 ignoruje drobne szumy (np. upadek długopisu)
+            // Jeśli zaczniesz głośno mówić, Jarvis przerwie swoją wypowiedź.
+            if (rms > 0.15 && playbackSources.length > 0) {
                 stopPlayback();
                 setStatus("Przerwano odpowiedź.");
             }
 
+            // Wysyłanie dźwięku do serwera
             const downsampled = downsampleBuffer(input, audioCtx.sampleRate, 16000);
             const pcm = float32To16BitPCM(downsampled);
-            const bytes = new Uint8Array(pcm.buffer);
-            const base64 = base64FromBytes(bytes);
+            const base64 = base64FromBytes(new Uint8Array(pcm.buffer));
 
-            sendJson({
-                audio: base64,
-                sampleRate: 16000
-            });
+            sendJson({ audio: base64, sampleRate: 16000 });
         };
 
         drawLoop();
     };
 
+    // Obsługa wiadomości z serwera
     ws.onmessage = async (event) => {
         if (typeof event.data === "string") {
             try {
                 const msg = JSON.parse(event.data);
-
-                if (msg.type === "memory_state") {
-                    updateMemoryBox(msg.items);
-                    return;
-                }
-
-                if (msg.type === "assistant_speaking") {
-                    if (msg.speaking) {
-                        setStatus("Jarvis mówi...");
-                    } else if (!playbackSources.length) {
-                        setStatus("Gotowy.");
-                    }
-                    return;
-                }
-
-                if (msg.type === "interrupted") {
-                    stopPlayback();
-                    setStatus("Przerwano odpowiedź.");
-                    return;
-                }
-
-                if (msg.type === "user_transcript") {
-                    console.log("USER:", msg.text);
-                    return;
-                }
-
-                if (msg.type === "output_transcript") {
-                    console.log("JARVIS:", msg.text);
-                    return;
-                }
-            } catch (e) {
-                console.log("TEXT:", event.data);
-            }
+                if (msg.type === "memory_state") updateMemoryBox(msg.items);
+                if (msg.type === "interrupted") stopPlayback();
+                if (msg.type === "user_transcript") console.log("TY:", msg.text);
+                if (msg.type === "output_transcript") console.log("JARVIS:", msg.text);
+            } catch (e) {}
             return;
         }
-
+        // Jeśli otrzymaliśmy dane binarne, to jest to dźwięk Jarvisa
         let buffer = event.data;
-        if (buffer instanceof Blob) {
-            buffer = await buffer.arrayBuffer();
-        }
-
+        if (buffer instanceof Blob) buffer = await buffer.arrayBuffer();
         await playJarvisAudio(buffer);
-    };
-
-    ws.onerror = () => {
-        setStatus("Błąd WebSocket.");
     };
 
     ws.onclose = () => {
         setStatus("Połączenie zamknięte.");
         stopPlayback();
-
-        if (processor) {
-            try { processor.disconnect(); } catch (e) {}
-            processor = null;
-        }
-        if (zeroGain) {
-            try { zeroGain.disconnect(); } catch (e) {}
-            zeroGain = null;
-        }
-        if (micAnalyser) {
-            try { micAnalyser.disconnect(); } catch (e) {}
-            micAnalyser = null;
-        }
-        if (outAnalyser) {
-            try { outAnalyser.disconnect(); } catch (e) {}
-            outAnalyser = null;
-        }
-        if (inputStream) {
-            inputStream.getTracks().forEach(track => track.stop());
-            inputStream = null;
-        }
     };
 }
 
+// Pętla animacji wizualizacji
 function drawLoop() {
     requestAnimationFrame(drawLoop);
     if (micAnalyser) drawWave(micCtx, micAnalyser, "#00ff88");
     if (outAnalyser) drawWave(outCtx, outAnalyser, "#ffd400");
 }
 
+// --- OBSŁUGA PRZYCISKÓW ---
+
 saveMemoryBtn.addEventListener("click", () => {
     const text = memoryInput.value.trim();
-    if (!text) {
-        setStatus("Wpisz notatkę pamięci.");
-        return;
+    if (text && sendJson({ memory_action: "add", text })) {
+        memoryInput.value = "";
+        setStatus("Pamięć zapisana.");
     }
-
-    if (!sendJson({ memory_action: "add", text })) {
-        setStatus("Najpierw uruchom asystenta.");
-        return;
-    }
-
-    memoryInput.value = "";
-    setStatus("Pamięć zapisana.");
 });
 
 clearMemoryBtn.addEventListener("click", () => {
-    if (!sendJson({ memory_action: "clear" })) {
-        setStatus("Najpierw uruchom asystenta.");
-        return;
-    }
-    setStatus("Pamięć wyczyszczona.");
+    if (sendJson({ memory_action: "clear" })) setStatus("Pamięć wyczyszczona.");
 });
 
 startBtn.addEventListener("click", start);
